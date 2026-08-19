@@ -1,0 +1,150 @@
+# =============================================================================
+#  orderflow-signals :: strategy + runtime configuration
+#  Every number here is an Agent-1 decision. Agent 2 code reads, never hardcodes.
+# =============================================================================
+
+exchange:
+  id: binanceusdm            # ccxt: USDT-M perpetual futures
+  quote: USDT
+  sandbox: false
+  rest_rate_limit_ms: 120    # ccxt enableRateLimit throttle
+  recv_window_ms: 5000
+  ws:
+    max_streams_per_conn: 180   # Binance combined-stream ceiling is 200; leave headroom
+    reconnect_backoff_s: [1, 2, 5, 10, 30, 60]
+    ping_interval_s: 20
+    stale_book_timeout_s: 15    # no depth update in 15s -> force resubscribe
+
+# --------------------------------------------------------------- UNIVERSE
+universe:
+  min_quote_volume_24h: 10_000_000   # hard mandate: >10M USDT
+  max_spread_bps: 5.0                # top-of-book spread ceiling
+  min_listing_age_days: 14           # skip listing-pump chaos
+  min_depth_usd_0p5pct: 150_000      # resting notional within +/-0.5% of mid
+  max_tracked_symbols: 40            # WS/CPU budget
+  refresh_minutes: 30
+  blacklist: [USDCUSDT, FDUSDUSDT, BTCDOMUSDT]
+  always_include: [BTCUSDT, ETHUSDT]  # needed for beta/correlation guard
+
+# --------------------------------------------------------------- MODES
+modes:
+  scalp:
+    enabled: true
+    timeframes: {bias: 1h,  liquidity: 15m, confirm: 5m,  entry: 3m}
+    min_rr_to_tp2: 2.0
+    min_confluence_score: 72
+    cooldown_minutes: 30
+    max_leverage: 20
+    signal_ttl_minutes: 25
+    footprint_bucket_seconds: 60          # entry range expires if unfilled
+  intraday:
+    enabled: true
+    timeframes: {bias: 4h,  liquidity: 1h,  confirm: 15m, entry: 5m}
+    min_rr_to_tp2: 2.5
+    min_confluence_score: 75
+    cooldown_minutes: 240
+    max_leverage: 10
+    signal_ttl_minutes: 90
+    footprint_bucket_seconds: 180
+  swing:
+    enabled: true
+    timeframes: {bias: 1d,  liquidity: 4h,  confirm: 1h,  entry: 15m}
+    min_rr_to_tp2: 3.0
+    min_confluence_score: 78
+    cooldown_minutes: 1440
+    max_leverage: 5
+    signal_ttl_minutes: 480
+    footprint_bucket_seconds: 300
+
+# --------------------------------------------------------------- STRUCTURE
+structure:
+  swing_fractal_lookback: 2       # bars each side of a pivot
+  displacement_atr_mult: 1.5      # impulse leg must exceed 1.5x ATR(14)
+  displacement_body_ratio: 0.55   # body / full range
+  equilibrium_pct: 0.50           # premium/discount split of the dealing range
+  atr_period: 14
+
+# --------------------------------------------------------------- LIQUIDITY
+liquidity:
+  equal_level_tolerance_atr: 0.10   # EQH/EQL clustering tolerance
+  min_touches_for_pool: 2
+  sweep_penetration_atr: 0.15       # wick must pierce level by >=0.15 ATR
+  sweep_reclaim_bars: 3             # and close back inside within N bars
+  sweep_volume_mult: 1.8            # vs SMA(20) volume of that timeframe
+  sweep_scan_bars: 15               # how far back a raid still counts as fresh
+  session_levels: [asia, london, newyork]
+  include_prev_day_high_low: true
+  include_prev_week_high_low: true
+
+# --------------------------------------------------------------- ZONES
+zones:
+  order_block:
+    require_displacement: true
+    mitigation_depth: 0.50          # entry at 50% of OB body (mean threshold)
+    max_age_bars: 60
+    invalidate_on_body_close: true  # body close through OB kills it
+  fvg:
+    min_gap_atr: 0.20
+    fill_depth: 0.50
+  breaker_blocks: true
+
+# --------------------------------------------------------------- VOLUME PROFILE
+volume_profile:
+  bins: 120
+  value_area_pct: 0.70
+  lookback_bars: {1h: 168, 4h: 180, 1d: 90}
+  lvn_percentile: 0.20              # bins below this = low-volume node
+  track_naked_poc: true
+
+# --------------------------------------------------------------- ORDERFLOW
+orderflow:
+  delta_source: aggTrade            # taker side from the 'm' flag
+  min_ready_bars: 12                # footprint buckets before flow can score
+  cvd_lookback_bars: 96
+  divergence_min_bars: 3
+  absorption:
+    volume_mult: 2.0                # >2x average bar volume
+    range_atr_mult: 0.5             # while range stays under 0.5 ATR
+  imbalance_ratio: 3.0              # stacked bid/ask imbalance threshold
+  book:
+    depth_levels: 20
+    band_pct: 0.30                  # measure imbalance within +/-0.30% of mid
+    wall_notional_mult: 4.0         # vs median level notional
+    wall_min_resting_s: 8           # anti-spoof: must persist 8s to count
+
+# --------------------------------------------------------------- RISK
+risk:
+  account_risk_pct: 1.0             # % of equity per idea (for leverage math)
+  sl_buffer_atr: 0.15
+  sl_min_buffer_bps: 8
+  liquidation_safety_factor: 0.40   # SL must sit within 40% of liq distance
+  absolute_leverage_ceiling: 25     # never advertise more, whatever the maths says
+  tp_allocation: {tp1: 0.40, tp2: 0.35, tp3: 0.25}
+  move_sl_to_be_after: tp1
+  trail_after: tp2
+
+# --------------------------------------------------------------- SCHEDULE
+schedule:
+  scan_interval_seconds: 20         # cascade pass over the whole universe
+  tracker_interval_seconds: 8       # live PnL + TP/SL detection
+  warmup_seconds: 25
+
+# --------------------------------------------------------------- FILTERS
+filters:
+  max_concurrent_signals: 6
+  max_same_direction_correlated: 2
+  max_signals_per_day: 12
+  btc_correlation_window_bars: 96
+  btc_correlation_threshold: 0.75
+  avoid_funding_window_minutes: 3   # around 00:00/08:00/16:00 UTC (scalp only)
+  min_minutes_between_any_signal: 5
+  news_blackout_minutes: 15         # requires optional calendar feed
+
+# --------------------------------------------------------------- TELEGRAM
+telegram:
+  parse_mode: HTML
+  max_messages_per_minute: 18       # Bot API allows 20/min to one chat
+  retry_attempts: 4
+  send_heartbeat_every_minutes: 60
+  send_startup_message: true
+  commands_enabled: true            # /status /active /pnl /report /why …

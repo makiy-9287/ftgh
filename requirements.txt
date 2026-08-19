@@ -1,0 +1,28 @@
+# --- exchange connectivity -------------------------------------------------
+ccxt==4.4.*                 # ccxt.pro (WebSocket) is bundled free since v4
+aiohttp==3.10.*
+websockets==13.*
+
+# --- async runtime ---------------------------------------------------------
+uvloop==0.20.*              # ~2x event-loop throughput on Linux
+tenacity==9.0.*             # retry/backoff for REST + WS reconnects
+APScheduler==3.10.*         # cron-style universe refresh / session boundaries
+
+# --- analytics -------------------------------------------------------------
+pandas==2.2.*
+numpy==1.26.*
+scipy==1.14.*               # KDE for volume-profile smoothing
+
+# --- notification ----------------------------------------------------------
+python-telegram-bot[rate-limiter]==21.*
+
+# --- infrastructure --------------------------------------------------------
+PyYAML==6.0.*
+python-dotenv==1.0.*
+orjson==3.10.*
+structlog==24.*
+aiosqlite==0.20.*           # signal journal + de-duplication ledger
+
+# --- dev / test (safe to strip on prod) ------------------------------------
+pytest==8.3.*
+pytest-asyncio==0.24.*
