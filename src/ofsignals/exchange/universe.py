@@ -8,6 +8,7 @@ consumes the ranked list this module produces.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -44,29 +45,50 @@ def _spread_bps(bid: float | None, ask: float | None) -> float:
     return (ask - bid) / mid * 10_000.0
 
 
-async def _measure_depth(exchange: Any, symbol: str, band_pct: float,
-                         limit: int = 50) -> float:
-    """Resting notional within +/- band_pct of mid. Cheap proxy for real depth."""
+async def _probe_book(exchange: Any, symbol: str, band_pct: float,
+                      limit: int = 500) -> tuple[float, float]:
+    """Return (spread_bps, resting notional within +/- band_pct of mid).
+
+    A single fetch gives both numbers. The previous limit of 50 levels was the
+    quiet killer here: on most futures pairs 50 levels span far less than 0.5%
+    of price, so measured depth was a fraction of real depth and almost
+    everything failed the threshold.
+    """
     try:
         book = await exchange.fetch_order_book(symbol, limit=limit)
     except Exception as exc:  # noqa: BLE001 - one bad book must not kill the scan
-        log.debug("depth_probe_failed", symbol=symbol, error=str(exc))
-        return 0.0
+        log.debug("book_probe_failed", symbol=symbol, error=str(exc)[:140])
+        return float("inf"), 0.0
 
     bids, asks = book.get("bids") or [], book.get("asks") or []
     if not bids or not asks:
-        return 0.0
+        return float("inf"), 0.0
 
-    mid = (bids[0][0] + asks[0][0]) / 2.0
+    best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
+    mid = (best_bid + best_ask) / 2.0
+    if mid <= 0:
+        return float("inf"), 0.0
+
+    spread_bps = (best_ask - best_bid) / mid * 10_000.0
     lo, hi = mid * (1 - band_pct / 100), mid * (1 + band_pct / 100)
-    notional = sum(p * q for p, q in bids if p >= lo)
-    notional += sum(p * q for p, q in asks if p <= hi)
-    return notional
+    notional = sum(float(p) * float(q) for p, q in bids if float(p) >= lo)
+    notional += sum(float(p) * float(q) for p, q in asks if float(p) <= hi)
+    return spread_bps, notional
 
 
 async def build_universe(exchange: Any, cfg: dict[str, Any],
                          probe_depth: bool = True) -> list[SymbolInfo]:
-    """Return the ranked, filtered instrument list."""
+    """Return the ranked, filtered instrument list.
+
+    ORDER MATTERS. Cheap metadata filters (volume, age, blacklist) run first
+    against a single bulk ticker call. Spread and depth need real order books,
+    so they are measured once, together, on the volume-ranked shortlist.
+
+    Spread is deliberately NOT taken from `fetch_tickers`: Binance's futures
+    24h ticker endpoint carries no bid/ask, so every symbol reported an
+    infinite spread and was rejected. Only force-included pairs survived, which
+    is why a 200-pair universe collapsed to BTC and ETH.
+    """
     started = time.perf_counter()
 
     markets = await exchange.load_markets(reload=True)
@@ -77,6 +99,7 @@ async def build_universe(exchange: Any, cfg: dict[str, Any],
     min_age_ms = int(cfg["min_listing_age_days"]) * _DAY_MS
     blacklist = {s.upper() for s in cfg.get("blacklist", [])}
     always = {s.upper() for s in cfg.get("always_include", [])}
+    max_tracked = int(cfg["max_tracked_symbols"])
     now_ms = exchange.milliseconds()
 
     candidates: list[SymbolInfo] = []
@@ -85,6 +108,7 @@ async def build_universe(exchange: Any, cfg: dict[str, Any],
     def reject(reason: str) -> None:
         rejected[reason] = rejected.get(reason, 0) + 1
 
+    # ---- stage 1: metadata only, no extra network calls -------------------
     for symbol, market in markets.items():
         if not (market.get("swap") and market.get("linear") and market.get("active")):
             continue
@@ -117,59 +141,79 @@ async def build_universe(exchange: Any, cfg: dict[str, Any],
             except (TypeError, ValueError):
                 pass
 
-        spread = _spread_bps(ticker.get("bid"), ticker.get("ask"))
-        if spread > max_spread and not forced:
-            reject("spread")
-            continue
-
         candidates.append(
             SymbolInfo(
                 symbol=symbol,
                 ws_symbol=native.lower(),
                 quote_volume_24h=quote_volume,
                 last_price=float(ticker.get("last") or 0.0),
-                spread_bps=spread,
+                spread_bps=float("nan"),      # measured from the book below
                 change_pct_24h=float(ticker.get("percentage") or 0.0),
             )
         )
 
-    # Depth probe is REST-heavy; only run it on the volume-sorted shortlist.
     candidates.sort(key=lambda s: s.quote_volume_24h, reverse=True)
-    shortlist = candidates[: int(cfg["max_tracked_symbols"]) * 2]
+    passed_metadata = len(candidates)
+    shortlist = candidates[: max_tracked * 3]
 
-    if probe_depth:
+    # ---- stage 2: one book probe per shortlisted symbol -------------------
+    if probe_depth and shortlist:
         band = float(cfg.get("depth_band_pct", 0.5))
+        limit = int(cfg.get("depth_probe_limit", 500))
         min_depth = float(cfg["min_depth_usd_0p5pct"])
-        sem = asyncio.Semaphore(8)
+        semaphore = asyncio.Semaphore(8)
 
         async def probe(info: SymbolInfo) -> None:
-            async with sem:
-                info.depth_usd_0p5pct = await _measure_depth(exchange, info.symbol, band)
+            async with semaphore:
+                spread, depth = await _probe_book(exchange, info.symbol, band, limit)
+                info.spread_bps = spread
+                info.depth_usd_0p5pct = depth
 
         await asyncio.gather(*(probe(i) for i in shortlist))
-        kept = []
-        for info in shortlist:
-            if info.ws_symbol.upper() in always or (info.depth_usd_0p5pct or 0) >= min_depth:
-                kept.append(info)
-            else:
-                reject("depth")
-        shortlist = kept
 
-    # Liquidity score blends turnover with book quality and tradeable range.
+        kept: list[SymbolInfo] = []
+        for info in shortlist:
+            if info.ws_symbol.upper() in always:
+                kept.append(info)
+                continue
+            if not math.isfinite(info.spread_bps):
+                reject("no_book")
+                continue
+            if info.spread_bps > max_spread:
+                reject("spread")
+                continue
+            if (info.depth_usd_0p5pct or 0.0) < min_depth:
+                reject("depth")
+                continue
+            kept.append(info)
+        shortlist = kept
+    else:
+        for info in shortlist:
+            info.spread_bps = 0.0
+
+    # ---- stage 3: rank ----------------------------------------------------
+    min_depth_ref = max(float(cfg["min_depth_usd_0p5pct"]), 1.0)
     for info in shortlist:
-        depth_term = (info.depth_usd_0p5pct or 0.0) / max(float(cfg["min_depth_usd_0p5pct"]), 1)
+        if not math.isfinite(info.spread_bps):
+            info.spread_bps = max_spread
+        depth_term = (info.depth_usd_0p5pct or 0.0) / min_depth_ref
         volume_term = info.quote_volume_24h / min_volume
         spread_term = max(0.1, 1.0 - info.spread_bps / max(max_spread, 0.1))
-        info.liquidity_score = round(volume_term * 0.6 + depth_term * 0.25 + spread_term * 0.15, 4)
+        info.liquidity_score = round(
+            volume_term * 0.6 + depth_term * 0.25 + spread_term * 0.15, 4)
 
     shortlist.sort(key=lambda s: s.liquidity_score, reverse=True)
-    universe = shortlist[: int(cfg["max_tracked_symbols"])]
+    universe = shortlist[:max_tracked]
 
-    log.info(
-        "universe_built",
-        kept=len(universe),
-        scanned=len(markets),
-        rejected=rejected,
-        elapsed_s=round(time.perf_counter() - started, 2),
-    )
+    stats = {
+        "kept": len(universe),
+        "passed_volume_filter": passed_metadata,
+        "probed": min(passed_metadata, max_tracked * 3),
+        "rejected": rejected,
+    }
+    log.info("universe_built", elapsed_s=round(time.perf_counter() - started, 2), **stats)
+    build_universe.last_stats = stats        # read by /watchlist
     return universe
+
+
+build_universe.last_stats = {}
