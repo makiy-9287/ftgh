@@ -45,6 +45,8 @@ class TradePlan:
     leverage: int
     leverage_max_safe: int
     risk_unit: float
+    fee_r: float = 0.0          # round-trip cost expressed in R
+    net_rr2: float = 0.0        # rr2 after fees — what the gate actually judges
     rejected_reason: str = ""
 
     @property
@@ -57,7 +59,7 @@ class TradePlan:
 
 
 def _rejection(reason: str, direction: Direction) -> TradePlan:
-    return TradePlan(direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, reason)
+    return TradePlan(direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, reason)
 
 
 # ------------------------------------------------------------------- stop loss
@@ -198,10 +200,20 @@ def build_plan(direction: Direction, zone: Zone, sweep: Sweep, atr_value: float,
     rr2 = abs(tp2 - reference_entry) / risk
     rr3 = abs(tp3 - reference_entry) / risk
 
+    # Fees are charged on notional, so their cost in R rises as the stop tightens.
+    # A 0.26% stop at 0.045% taker each way spends ~0.35R just entering and
+    # exiting. Judging the gate on gross R:R systematically overstates every
+    # tight-stop scalp, which is exactly where the engine trades most.
+    taker_fee_pct = float(risk_cfg.get("taker_fee_pct", 0.045))
+    fee_r = (taker_fee_pct * 2.0) / sl_distance_pct if sl_distance_pct > 0 else 0.0
+    net_rr2 = rr2 - fee_r
+
     min_rr = float(mode_cfg.get("min_rr_to_tp2", 2.0))
-    if rr2 < min_rr:
+    judged = net_rr2 if risk_cfg.get("fee_adjusted_rr", True) else rr2
+    if judged < min_rr:
         return _rejection(
-            f"R:R to TP2 {rr2:.2f} below {min_rr:.2f} floor — discarded, not resized",
+            f"net R:R to TP2 {judged:.2f} below {min_rr:.2f} floor "
+            f"(gross {rr2:.2f}, fees {fee_r:.2f}R) — discarded, not resized",
             direction)
 
     recommended, max_safe = derive_leverage(sl_distance_pct,
@@ -218,6 +230,8 @@ def build_plan(direction: Direction, zone: Zone, sweep: Sweep, atr_value: float,
         leverage=recommended,
         leverage_max_safe=max_safe,
         risk_unit=round(risk, 10),
+        fee_r=round(fee_r, 3),
+        net_rr2=round(net_rr2, 2),
     )
 
 
