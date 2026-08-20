@@ -169,8 +169,16 @@ def cumulative_delta(bars: list[FootprintBar]) -> np.ndarray:
 def analyse_flow(tape: TradeTape, bucket_ms: int, direction: Direction, cfg: dict,
                  poi_low: float | None = None, poi_high: float | None = None,
                  atr_value: float | None = None,
-                 min_ready_bars: int | None = None) -> FlowSnapshot:
-    """L3 of the cascade: did aggressive flow get absorbed?"""
+                 min_ready_bars: int | None = None,
+                 recent_bars: int = 4) -> FlowSnapshot:
+    """L3 of the cascade: did aggressive flow get absorbed?
+
+    `recent_bars` defines the "now" window and MUST be sized by the caller to
+    span the time since the sweep. Hardcoding it to 4 buckets was the defect
+    that blocked every signal: L2 accepts a raid up to 15 liquidity-TF bars old
+    (3.75 h on scalp), then L3 looked for the confirming flow in the last four
+    minutes. The evidence was always already gone.
+    """
     lookback = int(cfg.get("cvd_lookback_bars", 96))
     if min_ready_bars is None:
         min_ready_bars = int(cfg.get("min_ready_bars", 12))
@@ -187,8 +195,15 @@ def analyse_flow(tape: TradeTape, bucket_ms: int, direction: Direction, cfg: dic
     ranges = np.array([b.range for b in bars])
     deltas = np.array([b.delta for b in bars])
 
+    # Absorption and delta may use the ENTIRE post-sweep leg. Divergence cannot:
+    # it compares a recent extreme against a prior one, so it needs history left
+    # over to compare against, and is clamped to half the series.
+    recent_bars = max(3, min(int(recent_bars), len(bars)))
+    divergence_window = max(3, min(recent_bars, len(bars) // 2))
+
     min_separation = int(cfg.get("divergence_min_bars", 3))
-    divergence = _detect_divergence(lows, highs, cvd, direction, min_separation)
+    divergence = _detect_divergence(lows, highs, cvd, direction, min_separation,
+                                    divergence_window)
 
     absorption_cfg = cfg.get("absorption", {}) or {}
     absorption = _detect_absorption(
@@ -196,20 +211,31 @@ def analyse_flow(tape: TradeTape, bucket_ms: int, direction: Direction, cfg: dic
         volume_mult=float(absorption_cfg.get("volume_mult", 2.0)),
         range_atr_mult=float(absorption_cfg.get("range_atr_mult", 0.5)),
         atr_value=atr_value, poi_low=poi_low, poi_high=poi_high,
+        recent_bars=recent_bars,
     )
 
     sign = direction.sign
-    recent = deltas[-2:]
-    delta_flip = bool(sign != 0 and len(recent) == 2 and np.all(np.sign(recent) == sign))
+    last_two = deltas[-2:]
+    delta_flip = bool(sign != 0 and last_two.size == 2
+                      and np.all(np.sign(last_two) == sign))
 
-    window = deltas[-20:] if deltas.size >= 20 else deltas
+    # Net delta across the whole post-sweep window is the honest read: two
+    # positive one-minute bars mean little, a positive net over the leg means
+    # buyers actually took control.
+    window_delta = float(deltas[-recent_bars:].sum())
+    if not delta_flip and sign != 0:
+        delta_flip = bool(np.sign(window_delta) == sign
+                          and abs(window_delta) > abs(deltas).mean() * recent_bars * 0.3)
+
+    span = max(20, recent_bars * 2)
+    window = deltas[-span:] if deltas.size >= span else deltas
     if sign > 0:
         extreme_index = int(window.argmin())
     elif sign < 0:
         extreme_index = int(window.argmax())
     else:
         extreme_index = -1
-    delta_extreme = bool(extreme_index >= max(0, window.size - 4))
+    delta_extreme = bool(extreme_index >= max(0, window.size - recent_bars))
 
     return FlowSnapshot(
         ready=True,
@@ -219,25 +245,28 @@ def analyse_flow(tape: TradeTape, bucket_ms: int, direction: Direction, cfg: dic
         absorption=absorption,
         delta_flip=delta_flip,
         delta_extreme=delta_extreme,
-        note=f"{len(bars)} footprint bars",
+        note=(f"div={int(divergence)} abs={int(absorption)} "
+              f"flip={int(delta_flip)} ext={int(delta_extreme)} "
+              f"win={recent_bars}b of {len(bars)}"),
     )
 
 
 def _detect_divergence(lows: np.ndarray, highs: np.ndarray, cvd: np.ndarray,
-                       direction: Direction, min_separation: int) -> bool:
+                       direction: Direction, min_separation: int,
+                       recent_bars: int = 4) -> bool:
     """Price makes a new extreme; cumulative delta refuses to follow."""
     n = lows.size
-    if n < min_separation + 4 or cvd.size != n:
+    if n < min_separation + recent_bars or cvd.size != n:
         return False
 
-    recent = slice(max(0, n - 4), n)
-    prior_end = n - 4
-    prior_start = max(0, prior_end - 20)
+    recent = slice(max(0, n - recent_bars), n)
+    prior_end = n - recent_bars
+    prior_start = max(0, prior_end - max(20, recent_bars * 2))
     if prior_end - prior_start < min_separation:
         return False
 
     if direction is Direction.LONG:
-        recent_index = int(np.argmin(lows[recent])) + max(0, n - 4)
+        recent_index = int(np.argmin(lows[recent])) + max(0, n - recent_bars)
         prior_index = int(np.argmin(lows[prior_start:prior_end])) + prior_start
         if recent_index - prior_index < min_separation:
             return False
@@ -246,7 +275,7 @@ def _detect_divergence(lows: np.ndarray, highs: np.ndarray, cvd: np.ndarray,
         return bool(price_lower and cvd_higher)
 
     if direction is Direction.SHORT:
-        recent_index = int(np.argmax(highs[recent])) + max(0, n - 4)
+        recent_index = int(np.argmax(highs[recent])) + max(0, n - recent_bars)
         prior_index = int(np.argmax(highs[prior_start:prior_end])) + prior_start
         if recent_index - prior_index < min_separation:
             return False
@@ -260,7 +289,7 @@ def _detect_divergence(lows: np.ndarray, highs: np.ndarray, cvd: np.ndarray,
 def _detect_absorption(bars: list[FootprintBar], volumes: np.ndarray, ranges: np.ndarray,
                        volume_mult: float, range_atr_mult: float,
                        atr_value: float | None, poi_low: float | None,
-                       poi_high: float | None) -> bool:
+                       poi_high: float | None, recent_bars: int = 4) -> bool:
     """Heavy volume, compressed range, at the level that matters."""
     if volumes.size < 6:
         return False
@@ -270,7 +299,8 @@ def _detect_absorption(bars: list[FootprintBar], volumes: np.ndarray, ranges: np
 
     range_cap = (atr_value * range_atr_mult) if atr_value and atr_value > 0 else None
 
-    for bar, volume, bar_range in zip(bars[-4:], volumes[-4:], ranges[-4:]):
+    for bar, volume, bar_range in zip(bars[-recent_bars:], volumes[-recent_bars:],
+                                      ranges[-recent_bars:]):
         if volume < average * volume_mult:
             continue
         if range_cap is not None and bar_range >= range_cap:
