@@ -42,7 +42,9 @@ modes:
     max_leverage: 20
     signal_ttl_minutes: 25
     footprint_bucket_seconds: 60
-    min_confirmations: 2          # entry range expires if unfilled
+    min_confirmations: 2
+    htf_bias_timeframe: 4h
+    require_htf_alignment: true          # entry range expires if unfilled
   intraday:
     enabled: true
     timeframes: {bias: 4h,  liquidity: 1h,  confirm: 15m, entry: 5m}
@@ -53,6 +55,8 @@ modes:
     signal_ttl_minutes: 90
     footprint_bucket_seconds: 180
     min_confirmations: 2
+    htf_bias_timeframe: 1d
+    require_htf_alignment: true
   swing:
     enabled: true
     timeframes: {bias: 1d,  liquidity: 4h,  confirm: 1h,  entry: 15m}
@@ -63,6 +67,8 @@ modes:
     signal_ttl_minutes: 480
     footprint_bucket_seconds: 300
     min_confirmations: 1
+    htf_bias_timeframe: null          # nothing meaningful above the daily
+    require_htf_alignment: false
 
 # --------------------------------------------------------------- STRUCTURE
 structure:
@@ -71,6 +77,7 @@ structure:
   displacement_body_ratio: 0.55   # body / full range
   equilibrium_pct: 0.50           # premium/discount split of the dealing range
   atr_period: 14
+  volatility_percentile: 12         # reject only genuinely dead tape
 
 # --------------------------------------------------------------- LIQUIDITY
 liquidity:
@@ -78,7 +85,8 @@ liquidity:
   min_touches_for_pool: 2
   sweep_penetration_atr: 0.15       # wick must pierce level by >=0.15 ATR
   sweep_reclaim_bars: 3             # and close back inside within N bars
-  sweep_volume_mult: 1.8            # vs SMA(20) volume of that timeframe
+  sweep_volume_mult: 1.4            # HARD GATE vs SMA(20) volume
+  sweep_volume_good: 1.8            # full sweep score requires conviction volume
   sweep_scan_bars: 15               # how far back a raid still counts as fresh
   session_levels: [asia, london, newyork]
   include_prev_day_high_low: true
@@ -126,6 +134,8 @@ risk:
   account_risk_pct: 1.0             # % of equity per idea (for leverage math)
   sl_buffer_atr: 0.15
   sl_min_buffer_bps: 8
+  taker_fee_pct: 0.045              # per side; both sides charged in the R math
+  fee_adjusted_rr: true             # judge the R:R gate on NET, not gross
   liquidation_safety_factor: 0.40   # SL must sit within 40% of liq distance
   absolute_leverage_ceiling: 25     # never advertise more, whatever the maths says
   tp_allocation: {tp1: 0.40, tp2: 0.35, tp3: 0.25}
@@ -147,6 +157,7 @@ filters:
   btc_correlation_threshold: 0.75
   avoid_funding_window_minutes: 3   # around 00:00/08:00/16:00 UTC (scalp only)
   min_minutes_between_any_signal: 5
+  symbol_direction_cooldown_minutes: 90   # one idea per pair per side, any mode
   news_blackout_minutes: 15         # requires optional calendar feed
 
 # --------------------------------------------------------------- TELEGRAM
