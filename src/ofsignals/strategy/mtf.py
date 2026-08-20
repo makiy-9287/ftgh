@@ -93,6 +93,10 @@ class CascadeEngine:
         self.footprint_bucket_ms = int(
             self.mode_cfg.get("footprint_bucket_seconds", 60)) * 1000
         self.min_ready_bars = int(self.orderflow_cfg.get("min_ready_bars", 12))
+        # Swing theses are not decided by 5-minute footprint prints, so that mode
+        # leans on structure, liquidity and profile instead.
+        self.min_confirmations = int(self.mode_cfg.get(
+            "min_confirmations", self.orderflow_cfg.get("min_confirmations", 2)))
 
     # ------------------------------------------------------------- entrypoint
     async def evaluate(self, symbol: str) -> Evaluation:
@@ -160,19 +164,27 @@ class CascadeEngine:
             return _reject(symbol, self.mode, "L3", "no trade tape for symbol")
 
         confirm_atr = atr_at(confirm_c, -1, self.atr_period)
+
+        # The flow window must SPAN the post-sweep leg, not the last few minutes.
+        sweep_ts = int(liq_c.ts[sweep.reclaim_index])
+        elapsed_ms = max(0, int(liq_c.ts[-1]) - sweep_ts) + timeframe_ms(self.tf["liquidity"])
+        flow_window = int(elapsed_ms // self.footprint_bucket_ms) + 2
+        flow_window = max(4, min(flow_window, 60))
+
         flow: FlowSnapshot = analyse_flow(
             tape, self.footprint_bucket_ms, direction, self.orderflow_cfg,
             poi_low=mid_poi.bottom, poi_high=mid_poi.top, atr_value=confirm_atr,
-            min_ready_bars=self.min_ready_bars,
+            min_ready_bars=self.min_ready_bars, recent_bars=flow_window,
         )
         dom_pass, _ = dom_confirms(book, direction, self.orderflow_cfg)
         confirmations = flow.confirmations + (1 if dom_pass else 0)
 
-        if not flow.ready and confirmations < 2:
+        if not flow.ready and confirmations < self.min_confirmations:
             return _reject(symbol, self.mode, "L3", flow.note)
-        if confirmations < 2:
+        if confirmations < self.min_confirmations:
             return _reject(symbol, self.mode, "L3",
-                           f"only {confirmations}/2 order-flow confirmations")
+                           f"{confirmations}/{self.min_confirmations} confirmations "
+                           f"[{flow.note} dom={int(dom_pass)}]")
 
         veto = self._opposing_displacement_veto(confirm_c, direction, flow)
         if veto:
@@ -310,7 +322,10 @@ class CascadeEngine:
         blocks = zn.find_order_blocks(candles, ob_cfg, self.structure_cfg)
         fvgs = zn.find_fvgs(candles, fvg_cfg, self.structure_cfg)
         if self.zones_cfg.get("breaker_blocks", True):
-            blocks = blocks + zn.find_breakers(candles, blocks)
+            # Breakers come from INVALIDATED blocks, so they need their own fetch.
+            spent = zn.find_order_blocks(candles, ob_cfg, self.structure_cfg,
+                                         keep_invalidated=True)
+            blocks = blocks + zn.find_breakers(candles, spent)
 
         tolerance = atr_at(candles, -1, self.atr_period) * 0.5
         expanded = Zone(mid_poi.kind, mid_poi.direction, mid_poi.top + tolerance,
