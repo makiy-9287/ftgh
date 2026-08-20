@@ -14,15 +14,20 @@ exchange:
     reconnect_backoff_s: [1, 2, 5, 10, 30, 60]
     ping_interval_s: 20
     stale_book_timeout_s: 15    # no depth update in 15s -> force resubscribe
+    seed_pages: 1               # aggTrades costs weight 20/call - keep this low
+    seed_top_symbols: 40        # only the most liquid get a REST head start
+    seed_concurrency: 2
 
 # --------------------------------------------------------------- UNIVERSE
 universe:
   min_quote_volume_24h: 10_000_000   # hard mandate: >10M USDT
   max_spread_bps: 5.0                # top-of-book spread ceiling
   min_listing_age_days: 14           # skip listing-pump chaos
-  min_depth_usd_0p5pct: 150_000      # resting notional within +/-0.5% of mid
-  max_tracked_symbols: 40            # WS/CPU budget
-  refresh_minutes: 30
+  min_depth_usd_0p5pct: 75_000       # resting notional within +/-0.5% of mid
+  depth_probe_limit: 500            # book levels fetched; 50 under-measures badly
+  max_tracked_symbols: 120           # 120 x 2 WS streams; see notes in README
+  probe_headroom: 30                # extra symbols probed beyond the cap
+  refresh_minutes: 45
   blacklist: [USDCUSDT, FDUSDUSDT, BTCDOMUSDT]
   always_include: [BTCUSDT, ETHUSDT]  # needed for beta/correlation guard
 
@@ -36,7 +41,8 @@ modes:
     cooldown_minutes: 30
     max_leverage: 20
     signal_ttl_minutes: 25
-    footprint_bucket_seconds: 60          # entry range expires if unfilled
+    footprint_bucket_seconds: 60
+    min_confirmations: 2          # entry range expires if unfilled
   intraday:
     enabled: true
     timeframes: {bias: 4h,  liquidity: 1h,  confirm: 15m, entry: 5m}
@@ -46,6 +52,7 @@ modes:
     max_leverage: 10
     signal_ttl_minutes: 90
     footprint_bucket_seconds: 180
+    min_confirmations: 2
   swing:
     enabled: true
     timeframes: {bias: 1d,  liquidity: 4h,  confirm: 1h,  entry: 15m}
@@ -55,6 +62,7 @@ modes:
     max_leverage: 5
     signal_ttl_minutes: 480
     footprint_bucket_seconds: 300
+    min_confirmations: 1
 
 # --------------------------------------------------------------- STRUCTURE
 structure:
@@ -100,17 +108,18 @@ volume_profile:
 orderflow:
   delta_source: aggTrade            # taker side from the 'm' flag
   min_ready_bars: 12                # footprint buckets before flow can score
+  min_confirmations: 2              # L3 gate; per-mode override below
   cvd_lookback_bars: 96
   divergence_min_bars: 3
   absorption:
     volume_mult: 2.0                # >2x average bar volume
     range_atr_mult: 0.5             # while range stays under 0.5 ATR
-  imbalance_ratio: 3.0              # stacked bid/ask imbalance threshold
+  imbalance_ratio: 2.5              # stacked bid/ask imbalance threshold
   book:
     depth_levels: 20
-    band_pct: 0.30                  # measure imbalance within +/-0.30% of mid
+    band_pct: 0.50                  # measure imbalance within +/-0.50% of mid
     wall_notional_mult: 4.0         # vs median level notional
-    wall_min_resting_s: 8           # anti-spoof: must persist 8s to count
+    wall_min_resting_s: 5           # anti-spoof: must persist 5s to count
 
 # --------------------------------------------------------------- RISK
 risk:
@@ -131,9 +140,9 @@ schedule:
 
 # --------------------------------------------------------------- FILTERS
 filters:
-  max_concurrent_signals: 6
+  max_concurrent_signals: 10
   max_same_direction_correlated: 2
-  max_signals_per_day: 12
+  max_signals_per_day: 25
   btc_correlation_window_bars: 96
   btc_correlation_threshold: 0.75
   avoid_funding_window_minutes: 3   # around 00:00/08:00/16:00 UTC (scalp only)
