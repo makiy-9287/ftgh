@@ -11,7 +11,7 @@ portfolio rather than of the setup.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -54,14 +54,23 @@ class Evaluation:
     signal: Signal | None
     stage: str
     reason: str
+    detail: dict = field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
         return self.signal is not None
 
 
-def _reject(symbol: str, mode: str, stage: str, reason: str) -> Evaluation:
-    return Evaluation(symbol, mode, None, stage, reason)
+def _reject(symbol: str, mode: str, stage: str, reason: str,
+            detail: dict | None = None) -> Evaluation:
+    """`reason` MUST be a stable, low-cardinality string.
+
+    Embedding live values (div=0 abs=1 flip=1 …) made every L3 rejection a
+    unique histogram key, so 26 rejections became 26 entries of count 1 and
+    could never rank into the top reasons. The whole layer was invisible in
+    diagnostics. Variable data goes in `detail`, which is aggregated separately.
+    """
+    return Evaluation(symbol, mode, None, stage, reason, detail or {})
 
 
 class CascadeEngine:
@@ -98,6 +107,11 @@ class CascadeEngine:
         self.min_confirmations = int(self.mode_cfg.get(
             "min_confirmations", self.orderflow_cfg.get("min_confirmations", 2)))
 
+        # One timeframe above the bias TF. Taking a scalp long while the 4H is
+        # delivering down is how a good entry becomes a stopped-out good entry.
+        self.htf_timeframe: str | None = self.mode_cfg.get("htf_bias_timeframe")
+        self.require_htf = bool(self.mode_cfg.get("require_htf_alignment", False))
+
     # ------------------------------------------------------------- entrypoint
     async def evaluate(self, symbol: str) -> Evaluation:
         series = await self.candles.get_many(symbol, self.tf, limit=300)
@@ -114,11 +128,19 @@ class CascadeEngine:
         bias = compute_bias(bias_c, self.structure_cfg)
         if not bias.tradeable:
             return _reject(symbol, self.mode, "L1", bias.reason)
-        if not volatility_ok(bias_c, self.atr_period):
+        if not volatility_ok(bias_c, self.atr_period,
+                             float(self.structure_cfg.get("volatility_percentile", 12))):
             return _reject(symbol, self.mode, "L1", "bias-TF volatility in bottom quintile")
 
         direction = bias.direction
         dealing_range = bias.dealing_range
+
+        htf_aligned: bool | None = None
+        if self.htf_timeframe:
+            htf_aligned = await self._htf_agrees(symbol, direction)
+            if self.require_htf and htf_aligned is False:
+                return _reject(symbol, self.mode, "L1",
+                               f"{self.htf_timeframe} bias opposes the setup")
         eq = float(self.structure_cfg.get("equilibrium_pct", 0.50))
         price_in_half = (dealing_range.is_discount(price, eq) if direction is Direction.LONG
                          else dealing_range.is_premium(price, eq))
@@ -130,14 +152,13 @@ class CascadeEngine:
 
         # Detect FIRST, flag afterwards. Flagging first marks the pool that was
         # just raided as "already taken", and detection skips flagged pools.
-        sweep = liq.detect_sweep(liq_c, pools, self.liquidity_cfg, self.structure_cfg)
+        sweep = liq.detect_sweep(liq_c, pools, self.liquidity_cfg, self.structure_cfg,
+                                 direction=direction)
         liq.mark_swept(pools, liq_c, lookback=200,
                        skip_recent=int(self.liquidity_cfg.get("sweep_scan_bars", 15)))
         if sweep is None:
-            return _reject(symbol, self.mode, "L2", "no valid sweep with reclaim")
-        if sweep.direction is not direction:
             return _reject(symbol, self.mode, "L2",
-                           f"sweep implies {sweep.direction.value}, bias is {direction.value}")
+                           f"no valid {direction.value.lower()}-side sweep with reclaim")
 
         impulse = displacement_after(
             liq_c, sweep.reclaim_index, direction,
@@ -179,12 +200,18 @@ class CascadeEngine:
         dom_pass, _ = dom_confirms(book, direction, self.orderflow_cfg)
         confirmations = flow.confirmations + (1 if dom_pass else 0)
 
+        checks = {"div": int(flow.cvd_divergence), "abs": int(flow.absorption),
+                  "flip": int(flow.delta_flip and flow.delta_extreme),
+                  "dom": int(dom_pass)}
+
         if not flow.ready and confirmations < self.min_confirmations:
-            return _reject(symbol, self.mode, "L3", flow.note)
+            return _reject(symbol, self.mode, "L3", "trade tape still warming up",
+                           {"warmup": 1})
         if confirmations < self.min_confirmations:
-            return _reject(symbol, self.mode, "L3",
-                           f"{confirmations}/{self.min_confirmations} confirmations "
-                           f"[{flow.note} dom={int(dom_pass)}]")
+            return _reject(
+                symbol, self.mode, "L3",
+                f"{confirmations}/{self.min_confirmations} order-flow confirmations",
+                checks)
 
         veto = self._opposing_displacement_veto(confirm_c, direction, flow)
         if veto:
@@ -242,7 +269,9 @@ class CascadeEngine:
             entry_at_lvn=entry_at_lvn, naked_poc_target=naked_target, plan=plan,
             min_rr=float(self.mode_cfg.get("min_rr_to_tp2", 2.0)),
             orderflow_cfg=self.orderflow_cfg,
-            sweep_volume_floor=float(self.liquidity_cfg.get("sweep_volume_mult", 1.8)),
+            sweep_volume_floor=float(self.liquidity_cfg.get("sweep_volume_mult", 1.4)),
+            sweep_volume_good=float(self.liquidity_cfg.get("sweep_volume_good", 1.8)),
+            htf_aligned=htf_aligned,
             weekend=weekend,
         )
         gate = effective_gate(int(self.mode_cfg.get("min_confluence_score", 75)), weekend)
@@ -263,6 +292,21 @@ class CascadeEngine:
         return Evaluation(symbol, self.mode, signal, "published", "ok")
 
     # ---------------------------------------------------------------- pieces
+    async def _htf_agrees(self, symbol: str, direction: Direction) -> bool | None:
+        """None when the higher timeframe has no read; False only when it opposes."""
+        if not self.htf_timeframe:
+            return None
+        try:
+            candles = await self.candles.get(symbol, self.htf_timeframe, limit=200)
+        except Exception:  # noqa: BLE001 - alignment is advisory, never fatal
+            return None
+        if len(candles) < 60:
+            return None
+        htf = compute_bias(candles, self.structure_cfg)
+        if htf.direction is Direction.NONE:
+            return None
+        return htf.direction is direction
+
     def _book_snapshot(self, symbol: str, direction: Direction) -> BookSnapshot:
         state = self.hub.book_state(symbol) if self.hub else None
         if state is None:
