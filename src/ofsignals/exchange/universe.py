@@ -154,7 +154,11 @@ async def build_universe(exchange: Any, cfg: dict[str, Any],
 
     candidates.sort(key=lambda s: s.quote_volume_24h, reverse=True)
     passed_metadata = len(candidates)
-    shortlist = candidates[: max_tracked * 3]
+    # The probe shortlist is a REST weight decision, not a strategy one: at
+    # limit=500 each book costs weight 10, so `max_tracked * 3` would be 3600
+    # weight for a 120-symbol universe against a 2400/min ceiling.
+    probe_headroom = int(cfg.get("probe_headroom", 30))
+    shortlist = candidates[: max_tracked + probe_headroom]
 
     # ---- stage 2: one book probe per shortlisted symbol -------------------
     if probe_depth and shortlist:

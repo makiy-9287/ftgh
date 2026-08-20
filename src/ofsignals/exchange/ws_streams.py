@@ -56,6 +56,15 @@ class MarketDataHub:
         self._streams: dict[str, SymbolStreams] = {}
         self._stopping = False
 
+        # Seeding is a REST burst: aggTrades costs weight 20 per call, so
+        # 120 symbols x 3 pages would be 7200 weight against a 2400/min ceiling
+        # and earn an IP ban on every restart. Only the most liquid symbols are
+        # seeded, throttled, and only as a head start — every tape fills live.
+        self._seed_pages = int(self._ws_cfg.get("seed_pages", 1))
+        self._seed_top = int(self._ws_cfg.get("seed_top_symbols", 40))
+        self._seed_gate = asyncio.Semaphore(int(self._ws_cfg.get("seed_concurrency", 2)))
+        self._seeded = 0
+
     # ------------------------------------------------------------ properties
     @property
     def symbols(self) -> list[str]:
@@ -77,19 +86,28 @@ class MarketDataHub:
 
     # --------------------------------------------------------- subscriptions
     async def sync(self, symbols: list[str]) -> None:
-        """Reconcile live streams with the desired symbol set."""
+        """Reconcile live streams with the desired symbol set.
+
+        `symbols` arrives ranked by liquidity, so seeding naturally favours the
+        pairs where a head start is worth the REST weight.
+        """
         wanted = set(symbols)
         current = set(self._streams)
 
         for symbol in current - wanted:
             await self.unsubscribe(symbol)
-        for symbol in wanted - current:
-            await self.subscribe(symbol)
+
+        added = 0
+        for symbol in symbols:            # preserve rank order
+            if symbol in current:
+                continue
+            await self.subscribe(symbol, seed=added < self._seed_top)
+            added += 1
 
         log.info("streams_synced", live=len(self._streams),
                  added=len(wanted - current), removed=len(current - wanted))
 
-    async def subscribe(self, symbol: str) -> None:
+    async def subscribe(self, symbol: str, seed: bool = True) -> None:
         if symbol in self._streams:
             return
         stream = SymbolStreams(symbol, BookState(symbol), TradeTape(symbol))
@@ -98,7 +116,9 @@ class MarketDataHub:
             asyncio.create_task(self._watch_book(stream), name=f"book:{symbol}"),
             asyncio.create_task(self._watch_trades(stream), name=f"trades:{symbol}"),
         ]
-        asyncio.create_task(self._seed_tape(stream), name=f"seed:{symbol}")
+        if seed and self._seeded < self._seed_top:
+            self._seeded += 1
+            asyncio.create_task(self._seed_tape(stream), name=f"seed:{symbol}")
 
     async def unsubscribe(self, symbol: str) -> None:
         stream = self._streams.pop(symbol, None)
@@ -112,6 +132,7 @@ class MarketDataHub:
 
     async def close(self) -> None:
         self._stopping = True
+        self._seeded = 0
         for symbol in list(self._streams):
             await self.unsubscribe(symbol)
 
@@ -154,8 +175,18 @@ class MarketDataHub:
                             error=str(exc)[:200], retry_in=delay)
                 await asyncio.sleep(delay)
 
-    async def _seed_tape(self, stream: SymbolStreams, pages: int = 3) -> None:
+    async def _seed_tape(self, stream: SymbolStreams, pages: int | None = None) -> None:
         """Backfill recent prints so footprint warmup starts partway home."""
+        pages = pages or self._seed_pages
+        try:
+            async with self._seed_gate:
+                await self._do_seed(stream, pages)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - seeding is best-effort
+            log.debug("tape_seed_failed", symbol=stream.symbol, error=str(exc)[:160])
+
+    async def _do_seed(self, stream: SymbolStreams, pages: int) -> None:
         try:
             since = self._rest.milliseconds() - 90 * 60_000
             total = 0
@@ -167,6 +198,7 @@ class MarketDataHub:
                 since = int(trades[-1]["timestamp"]) + 1
                 if len(trades) < 1000:
                     break
+                await asyncio.sleep(0.3)          # pace the weight
             log.debug("tape_seeded", symbol=stream.symbol, trades=total)
         except asyncio.CancelledError:
             raise
